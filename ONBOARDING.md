@@ -344,3 +344,624 @@ cargo xtask build-cli
 | **`LazyLock<VersionReq>`** | Protocol crate | Gates features by protocol version so old agents work with new layers (and vice versa) |
 | **Detour enum** (`Success` / `Bypass` / `Error`) | Layer hooks | Clean control flow for "did we handle it, skip it, or fail?" |
 | **Parent/child process in agent** | `entrypoint.rs` | Parent exists solely to clean up iptables, even if child crashes |
+
+---
+
+## 9. Critical Flows (Code-Level Walkthroughs)
+
+This section traces every important flow through the actual source code. Each flow shows what happens conceptually, which files and functions are involved, what protocol messages fly between components, and how data gets from your app to the cluster and back.
+
+### 9.1 Startup Flow: `mirrord exec`
+
+This is the first flow to understand. Everything starts here. When you type:
+
+```
+mirrord exec --target pod/my-app -- python server.py
+```
+
+...six things happen in sequence: parse config, create agent in Kubernetes, start the intproxy, launch your app with the layer injected, initialize the layer, and connect everything together.
+
+#### Step 1: CLI parses config and resolves the target
+
+**Where:** `mirrord/cli/src/main.rs` — `exec()` calls `exec_process()`
+
+The CLI loads configuration from three sources (lowest to highest priority): config file (JSON/YAML), environment variables, CLI arguments. The result is a `LayerConfig` struct.
+
+```
+exec() → exec_process()
+         ├── LayerConfig::resolve()   — merge all config sources
+         └── config.verify()          — validate settings
+```
+
+#### Step 2: Create the agent pod in Kubernetes
+
+**Where:** `mirrord/cli/src/connection.rs` — `create_and_connect()`; `mirrord/kube/src/api/kubernetes.rs` — `KubernetesAPI::create_agent()`
+
+The CLI connects to your Kubernetes cluster (using your kubeconfig) and creates an agent. The agent is a Kubernetes **Job** — a pod that runs once and exits. It is placed in the same namespace as your target pod and given access to the target's filesystem and network.
+
+```
+create_and_connect()
+├── KubernetesAPI::new()              — connect to cluster
+└── k8s_api.create_agent()            — create agent Job
+    ├── create_agent_params()         — get target's container PID, environment
+    └── Targeted::create_agent()      — submit Job to K8s API
+        └── returns AgentKubernetesConnectInfo { pod_name, agent_port }
+```
+
+The agent type depends on config:
+- **Targeted + Job** (default): creates a Job pod alongside the target
+- **Targeted + Ephemeral**: injects an ephemeral container into the target pod itself
+- **Targetless**: creates a standalone Job with no specific target
+
+#### Step 3: Start the intproxy
+
+**Where:** `mirrord/cli/src/execution.rs` — `MirrordExecution::start_internal()`; `mirrord/cli/src/internal_proxy.rs` — `proxy()`
+
+The CLI spawns a child process running `mirrord intproxy`. It passes connection details through environment variables:
+
+| Environment variable | Value | Purpose |
+|---------------------|-------|---------|
+| `MIRRORD_AGENT_CONNECT_INFO` | JSON | Tells intproxy how to reach the agent (pod name, port, namespace) |
+| `MIRRORD_LAYER_RESOLVED_CONFIG` | Base64 | Full config for the layer to read later |
+
+The intproxy process:
+1. Reads `MIRRORD_AGENT_CONNECT_INFO` from its environment
+2. Connects to the agent via Kubernetes port-forward (a tunnel from your laptop to the agent pod)
+3. Sends `ClientMessage::Ping`, waits for `DaemonMessage::Pong` to confirm the connection works
+4. Opens a TCP listener on localhost (random port)
+5. Prints the listener address (e.g. `127.0.0.1:54321`) to stdout — the CLI reads this
+
+```
+proxy()
+├── read MIRRORD_AGENT_CONNECT_INFO env var
+├── connect_and_ping()
+│   ├── AgentConnection::new()     — TCP via K8s port-forward
+│   ├── send Ping
+│   └── wait for Pong
+├── create TCP listener on localhost
+├── print address to stdout         — CLI reads this line
+└── IntProxy::run()                 — start main event loop
+```
+
+**Where the intproxy event loop lives:** `mirrord/intproxy/src/lib.rs` — `IntProxy::run_inner()`. It starts several background tasks:
+
+| Task | What it does |
+|------|-------------|
+| `LayerInitializer` | Accepts new layer TCP connections |
+| `LayerConnection` (one per layer) | Handles messages from each layer instance |
+| `AgentConnection` | Manages the single connection to the agent |
+| `FilesProxy` | Routes file operation requests/responses |
+| `IncomingProxy` | Routes incoming traffic (steal/mirror) messages |
+| `OutgoingProxy` | Routes outgoing connection messages |
+| `SimpleProxy` | Routes DNS and environment variable messages |
+| `PingPong` | Periodic health checks |
+
+#### Step 4: Launch your application with the layer injected
+
+**Where:** `mirrord/cli/src/main.rs` — end of `exec_process()`
+
+The CLI sets three critical environment variables and then replaces itself with your application using `execve` (a Unix system call that swaps the current process for a new one):
+
+| Environment variable | Value | Purpose |
+|---------------------|-------|---------|
+| `LD_PRELOAD` (Linux) or `DYLD_INSERT_LIBRARIES` (macOS) | Path to `libmirrord_layer.so` / `.dylib` | Forces the OS to load the layer library into your process |
+| `MIRRORD_LAYER_INTPROXY_ADDR` | `127.0.0.1:<port>` | Tells the layer where to find the intproxy |
+| `MIRRORD_LAYER_RESOLVED_CONFIG` | Base64-encoded config | Full configuration for the layer |
+
+After `execve`, the CLI process is gone. Your application process takes over, with the layer loaded.
+
+#### Step 5: Layer initializes inside your process
+
+**Where:** `mirrord/layer/src/lib.rs` — `mirrord_layer_entry_point()` (marked `#[ctor]`, which means it runs automatically when the library loads, before your app's `main()`)
+
+```
+#[ctor] mirrord_layer_entry_point()
+└── layer_pre_initialization()
+    ├── read config from MIRRORD_LAYER_RESOLVED_CONFIG env var
+    ├── decide load type: Full / SIPOnly / Skip
+    └── layer_start(config)                    — for Full load:
+        ├── init_tracing()                     — set up logging
+        ├── init_layer_setup(config)           — prepare file filters, socket config
+        ├── enable_hooks()                     — replace libc functions with detours
+        │   ├── file::hooks::enable_file_hooks()    — open, read, write, close, stat...
+        │   ├── socket::hooks::enable_socket_hooks() — socket, bind, listen, connect...
+        │   └── exec_hooks::enable_exec_hooks()      — execve, fork, for child processes
+        ├── ProxyConnection::new(intproxy_addr) — TCP connect to intproxy
+        └── fetch_env_vars()                   — get remote env vars from target pod
+```
+
+The `enable_hooks()` function uses Frida GUM to replace libc functions. After this call, every `open()`, `connect()`, `bind()`, etc. in your process goes through the layer's detour functions first.
+
+#### Step 6: Everything is connected
+
+After initialization, the full chain is in place:
+
+```
+Your App ←→ Layer (in-process) ←→ Intproxy (localhost TCP) ←→ Agent (K8s port-forward) ←→ Target Pod
+```
+
+Every subsequent syscall flows through this chain. The following sections trace each type of operation.
+
+---
+
+### 9.2 File Open Flow
+
+**Scenario:** Your app calls `open("/etc/hosts", O_RDONLY)`. mirrord intercepts this and opens the file on the target pod's filesystem instead.
+
+#### Conceptual steps
+
+1. Your app calls `open()` — the layer's hook fires instead of libc's
+2. Layer decides: should this path be remote or local?
+3. If remote: layer sends a request to the agent (via intproxy)
+4. Agent opens the file on the target's filesystem
+5. Agent returns a remote file descriptor (a number identifying the open file)
+6. Layer creates a local placeholder file and maps local fd → remote fd
+7. Layer returns the local fd to your app — your app doesn't know anything happened
+
+#### Code trace
+
+**Layer hook** — `mirrord/layer/src/file/hooks.rs`:
+
+```
+open_detour(raw_path, open_flags)                    — hooks.rs
+├── DetourGuard::new()                                — if None, we're already in a hook → call original libc open
+├── open(path, open_options)                          — file/ops.rs
+│   ├── common_path_check(path, is_write)             — check file filter, apply path remapping
+│   │   └── returns Bypass if path should stay local
+│   └── RemoteFile::remote_open(path, open_options)   — file/ops.rs
+│       ├── create OpenFileRequest { path, open_options }
+│       └── make_proxy_request_with_response(request)  — layer-lib/proxy_connection.rs
+│           ├── assign message_id (atomic counter)
+│           ├── encode and send via TCP to intproxy
+│           └── block waiting for response with matching message_id
+```
+
+**Intproxy routing** — `mirrord/intproxy/src/lib.rs`:
+
+```
+handle_layer_message(FromLayer { message_id, layer_id, message })
+└── match message:
+    LayerToProxyMessage::File(req) →
+        FilesProxy.send(FilesProxyMessage::FileReq(message_id, layer_id, req))
+```
+
+**FilesProxy** — `mirrord/intproxy/src/proxies/files.rs`:
+
+```
+FilesProxy::run() receives FileReq
+├── store (message_id, layer_id) in request queue     — for matching the response later
+└── send ClientMessage::FileRequest(req) to agent via AgentConnection
+```
+
+**Agent handler** — `mirrord/agent/src/entrypoint.rs`:
+
+```
+handle_client_message(ClientMessage::FileRequest(req))
+└── file_manager.handle_message(req)                   — agent/src/file.rs
+    └── match FileRequest::Open { path, open_options }:
+        FileManager::open(path, open_options)
+        ├── resolve_path(&path)                        — prepend /proc/<pid>/root/ to see target's filesystem
+        ├── OpenOptions::from(open_options).open(&path) — actually open the file
+        ├── allocate remote fd from counter
+        ├── store in self.open_files HashMap
+        └── return OpenFileResponse { fd }
+→ respond(DaemonMessage::File(FileResponse::Open { fd }))
+```
+
+**Response flows back:**
+
+```
+Agent → (TCP) → Intproxy
+    handle_agent_message(DaemonMessage::File(response))
+    └── FilesProxy.send(FilesProxyMessage::FileRes(response))
+        └── pop (message_id, layer_id) from request queue
+        └── send ToLayer { message_id, layer_id, response } → LayerConnection → Layer
+```
+
+**Layer receives response** — back in `file/ops.rs`:
+
+```
+RemoteFile::remote_open() receives OpenFileResponse { fd: 42 }
+├── create_local_fake_file(42)      — create temp file, open it to get a local fd (say, 5)
+├── OPEN_FILES.insert(5, Arc::new(RemoteFile { fd: 42, path }))
+└── return local fd 5 to the app
+```
+
+#### Protocol messages involved
+
+| Direction | Message | Defined in |
+|-----------|---------|------------|
+| Layer → Agent | `ClientMessage::FileRequest(FileRequest::Open { path, open_options })` | `protocol/src/codec.rs`, `protocol/src/file.rs` |
+| Agent → Layer | `DaemonMessage::File(FileResponse::Open { fd })` | `protocol/src/codec.rs`, `protocol/src/file.rs` |
+
+#### Why the local fake file?
+
+Your app expects `open()` to return a real file descriptor (fd) — a number the OS recognizes. The layer can't return the agent's fd number directly because the OS doesn't know about it. So the layer creates a real local file (a temp file), gets its fd, and maintains a mapping. When your app later calls `read(5)`, the layer sees fd 5, looks up remote fd 42, and sends the read to the agent.
+
+---
+
+### 9.3 File Read/Write Flow
+
+**Scenario:** After opening a remote file (fd 5 locally, fd 42 on the agent), your app calls `read(5, buffer, 1024)`.
+
+#### Code trace
+
+**Layer hook** — `mirrord/layer/src/file/hooks.rs`:
+
+```
+read_detour(fd=5, buf, count=1024)
+├── DetourGuard::new()
+├── get_remote_fd(5)                                  — file/ops.rs
+│   └── OPEN_FILES.lock().get(&5) → RemoteFile { fd: 42 }
+├── RemoteFile::remote_read(42, 1024)
+│   ├── create ReadFileRequest { remote_fd: 42, buffer_size: 1024 }
+│   └── make_proxy_request_with_response(request)     — blocks until agent responds
+```
+
+**Agent** — `mirrord/agent/src/file.rs`:
+
+```
+FileManager::read(fd=42, buffer_size=1024)
+├── self.open_files.get_mut(&42) → the actual file handle
+├── file.read(&mut buffer)                            — read from target's filesystem
+└── return ReadFileResponse { bytes, read_amount }
+```
+
+**Write works identically** but in reverse — `write_detour` sends `WriteFileRequest { fd, write_bytes }`, agent calls `file.write(&buffer)`, returns `WriteFileResponse { written_amount }`.
+
+#### Protocol messages
+
+| Direction | Message |
+|-----------|---------|
+| Layer → Agent | `FileRequest::Read { remote_fd, buffer_size }` or `FileRequest::Write { fd, write_bytes }` |
+| Agent → Layer | `FileResponse::Read { bytes, read_amount }` or `FileResponse::Write { written_amount }` |
+
+---
+
+### 9.4 File Close Flow
+
+**Scenario:** Your app calls `close(5)` on a remotely-opened file.
+
+This flow uses a Rust pattern: the layer stores remote files as `Arc<RemoteFile>` (a reference-counted smart pointer). When the last reference is dropped, the `Drop` implementation sends the close request. This handles `dup()` correctly — if your app duplicates a file descriptor, both fds point to the same `Arc`. Closing one fd decrements the count; only the last close sends the remote close.
+
+```
+close_detour(fd=5)
+├── OPEN_FILES.lock().remove(&5) → drops Arc<RemoteFile>
+│   └── if last reference (Arc count reaches 0):
+│       RemoteFile::drop()
+│       └── make_proxy_request_no_response(CloseFileRequest { fd: 42 })
+│           → agent removes fd 42 from its open_files HashMap
+```
+
+Note: `close` uses `make_proxy_request_no_response` — it sends the message but doesn't wait for a reply. The agent just cleans up silently.
+
+---
+
+### 9.5 Incoming Traffic Flow (Steal Mode)
+
+**Scenario:** Your app is a web server. It calls `bind(sock, 0.0.0.0:8080)` then `listen(sock)`. mirrord redirects real traffic hitting the pod's port 8080 to your local machine.
+
+This is the most complex flow. It involves four stages: bind, listen (subscribe), receive connection, and exchange data.
+
+#### Stage 1: Bind
+
+**Where:** `mirrord/layer/src/socket/hooks.rs` — `bind_detour()`; `mirrord/layer/src/socket/ops.rs` — `bind()`
+
+```
+bind_detour(sockfd, raw_address=0.0.0.0:8080, address_length)
+├── DetourGuard::new()
+├── bind(sockfd, raw_address, address_length)          — socket/ops.rs
+│   ├── retrieve socket from SOCKETS HashMap
+│   ├── check incoming config: should we handle port 8080?
+│   │   └── if port is in the ignore list → call original libc bind, done
+│   ├── bind_similar_address(sockfd, address)          — bind locally
+│   │   ├── try binding to 0.0.0.0:8080 locally
+│   │   ├── if port taken → try port 0 (random)       — OS assigns a free port
+│   │   └── get actual bound address with getsockname()
+│   └── update SOCKETS: state = Bound { requested_port: 8080, actual_port: <random> }
+```
+
+The layer binds locally on a potentially different port. This is fine — the layer knows the mapping.
+
+#### Stage 2: Listen (triggers port subscription)
+
+**Where:** `mirrord/layer/src/socket/ops.rs` — `listen()`
+
+```
+listen_detour(sockfd, backlog)
+├── retrieve socket from SOCKETS — must be in Bound state
+├── call original libc listen(sockfd, backlog)         — start listening locally
+├── send PortSubscribe to agent:
+│   make_proxy_request_with_response(
+│       IncomingRequest::PortSubscribe(Port {
+│           port: 8080,           — the port on the target pod
+│           listening_on: <local address the layer actually bound to>
+│       })
+│   )
+└── update SOCKETS: state = Listening
+```
+
+**Intproxy** routes this to `IncomingProxy`, which forwards to the agent as `ClientMessage::Tcp(LayerTcp::PortSubscribe)` or `ClientMessage::TcpSteal(LayerTcpSteal::PortSubscribe)` depending on the mode.
+
+**Agent** — `mirrord/agent/src/steal/`:
+
+```
+TcpStealerTask receives PortSubscribe(port=8080)
+└── RedirectorTask sets up iptables rule:
+    iptables -t nat -A PREROUTING -p tcp --dport 8080 -j REDIRECT --to-port <agent_port>
+```
+
+This rule intercepts all TCP packets destined for port 8080 on the target pod and redirects them to the agent's listening port instead. The real application in the pod stops receiving traffic on that port.
+
+#### Stage 3: Receive connection
+
+When external traffic hits the pod on port 8080:
+
+```
+1. iptables redirects the packet to the agent
+2. Agent accepts the connection
+3. Agent sends DaemonMessage::TcpSteal(DaemonTcp::NewTcpConnection { connection_id, source, destination })
+4. Intproxy routes to IncomingProxy
+5. IncomingProxy creates a local TCP connection to the layer's listening address
+6. Layer's accept() returns this connection to your app
+```
+
+Your app sees a new connection on its listening socket. From your app's perspective, a client just connected — it doesn't know the connection was proxied through an agent in a Kubernetes cluster.
+
+#### Stage 4: Data exchange
+
+```
+External client → target pod:8080 → (iptables redirect) → agent
+Agent sends: DaemonTcp::Data { connection_id, bytes }
+→ intproxy IncomingProxy → local TCP → layer → your app reads data
+
+Your app writes response → layer → local TCP → intproxy IncomingProxy
+→ ClientMessage::TcpSteal(LayerTcpSteal::Data { connection_id, bytes })
+→ agent → external client
+```
+
+#### Protocol messages
+
+| Direction | Message | When |
+|-----------|---------|------|
+| Layer → Agent | `LayerTcpSteal::PortSubscribe(StealType::All(port))` | App calls `listen()` |
+| Agent → Layer | `DaemonTcp::SubscribeResult` | Confirms subscription |
+| Agent → Layer | `DaemonTcp::NewTcpConnection { connection_id, source, destination }` | External client connects |
+| Agent → Layer | `DaemonTcp::Data { connection_id, bytes }` | Client sends data |
+| Layer → Agent | `LayerTcpSteal::Data { connection_id, bytes }` | App sends response |
+| Agent → Layer | `DaemonTcp::Close { connection_id }` | Connection ends |
+
+---
+
+### 9.6 Outgoing Connection Flow
+
+**Scenario:** Your app calls `connect(sock, "10.0.0.5:3306")` to reach a MySQL database that's only accessible from inside the cluster.
+
+#### Conceptual steps
+
+1. Layer intercepts `connect()`
+2. Layer sends the destination address to the agent
+3. Agent makes the real TCP connection from inside the target pod's network namespace — so it uses the pod's routing, DNS, and firewall rules
+4. Data is proxied: app writes → layer → intproxy → agent → database, and back
+
+#### Code trace
+
+**Layer** — `mirrord/layer/src/socket/hooks.rs` — `connect_detour()`:
+
+```
+connect_detour(sockfd, raw_address=10.0.0.5:3306, address_length)
+├── DetourGuard::new()
+├── connect(sockfd, raw_address, address_length)       — socket/ops.rs
+│   ├── check outgoing config: is outgoing interception enabled?
+│   │   └── if disabled or address filtered out → call original libc connect, done
+│   ├── send OutgoingConnectRequest { remote_address: 10.0.0.5:3306 }
+│   │   via make_proxy_request_with_response()
+│   └── receive response with local proxy address
+│       └── call original libc connect(sockfd, localhost:<proxy_port>)
+```
+
+**Intproxy** — `OutgoingProxy` receives the request, forwards to agent as `ClientMessage::TcpOutgoing(LayerTcpOutgoing::Connect)`.
+
+**Agent** — `mirrord/agent/src/outgoing.rs`:
+
+```
+TcpOutgoingApi receives LayerConnect { remote_address: 10.0.0.5:3306 }
+├── spawn connection task in target's network namespace
+│   └── TcpStream::connect("10.0.0.5:3306")           — real connection from the pod's network
+└── send DaemonTcpOutgoing::Connect { connection_id } back
+```
+
+**Data proxying:** Once connected, the `OutgoingProxy` in the intproxy creates a local TCP socket pair. Your app writes to one end; the intproxy reads from it and sends data to the agent, which writes to the real database connection. Responses flow back the same way.
+
+#### Protocol messages
+
+| Direction | Message |
+|-----------|---------|
+| Layer → Agent | `ClientMessage::TcpOutgoing(LayerTcpOutgoing::Connect { remote_address })` |
+| Agent → Layer | `DaemonMessage::TcpOutgoing(DaemonTcpOutgoing::Connect { connection_id })` |
+| Both directions | `TcpOutgoing::Data { connection_id, bytes }` for data transfer |
+| Either side | `TcpOutgoing::Close { connection_id }` when connection ends |
+
+---
+
+### 9.7 DNS Resolution Flow
+
+**Scenario:** Your app calls `getaddrinfo("my-service.default.svc.cluster.local", "80", ...)` to resolve a Kubernetes service name. This hostname only exists inside the cluster's DNS — your laptop doesn't know about it.
+
+#### Code trace
+
+**Layer** — `mirrord/layer/src/socket/hooks.rs` — `getaddrinfo_detour()`:
+
+```
+getaddrinfo_detour(node="my-service.default.svc.cluster.local", service="80", hints, result)
+├── DetourGuard::new()
+├── check DNS config: is DNS interception enabled?
+├── create GetAddrInfoRequest { node: "my-service.default.svc.cluster.local" }
+├── make_proxy_request_with_response(request)
+│   → intproxy SimpleProxy → agent
+```
+
+**Intproxy** — `SimpleProxy` handles this:
+
+```
+SimpleProxy receives AddrInfoReq(msg_id, layer_id, request)
+├── push (msg_id, layer_id) onto addr_info_reqs queue
+└── send ClientMessage::GetAddrInfoRequest(request) to agent
+```
+
+**Agent** — `mirrord/agent/src/dns.rs`:
+
+```
+DnsWorker receives GetAddrInfoRequest
+├── resolve hostname using target pod's DNS configuration
+│   └── reads /etc/resolv.conf from target's network namespace
+│       which contains cluster DNS server (e.g. 10.96.0.10)
+│       and search domains (e.g. default.svc.cluster.local)
+└── return GetAddrInfoResponse { addresses: [10.96.42.7] }
+```
+
+**Layer receives response** and allocates `libc::addrinfo` structs that it returns to your app. Your app gets back the cluster-internal IP address `10.96.42.7` for the service, as if it were running inside the cluster.
+
+#### Protocol messages
+
+| Direction | Message |
+|-----------|---------|
+| Layer → Agent | `ClientMessage::GetAddrInfoRequest { node }` (or V2 with hints) |
+| Agent → Layer | `DaemonMessage::GetAddrInfoResponse(Ok(addresses))` |
+
+---
+
+### 9.8 Environment Variables Flow
+
+**Scenario:** Your app reads `os.environ["DATABASE_URL"]`. mirrord imports this variable from the target pod so your app sees the cluster's value.
+
+This flow is different from the others — it happens once during layer initialization, not on every syscall.
+
+#### Code trace
+
+**Layer** — `mirrord/layer/src/lib.rs` — `layer_start()`:
+
+```
+layer_start(config)
+├── ... (hooks setup, proxy connection) ...
+└── if config.feature.env is enabled:
+    fetch_env_vars()
+    ├── create GetEnvVarsRequest { env_vars_filter, env_vars_select }
+    │   — filter/select controls which vars to import (include/exclude lists)
+    ├── make_proxy_request_with_response(request)
+    └── for each (key, value) in response:
+        std::env::set_var(key, value)    — inject into process environment
+```
+
+**Agent** — `mirrord/agent/src/entrypoint.rs`:
+
+```
+handle_client_message(ClientMessage::GetEnvVarsRequest(req))
+├── env::select_env_vars(self.env.clone(), req.env_vars_filter, req.env_vars_select)
+│   └── self.env was populated at agent startup by reading the target container's
+│       environment via container runtime API (Docker/containerd inspect) or
+│       /proc/<pid>/environ
+└── respond(DaemonMessage::GetEnvVarsResponse(filtered_env))
+```
+
+After this, `std::env::var("DATABASE_URL")` in your app returns the value from the target pod.
+
+#### Protocol messages
+
+| Direction | Message |
+|-----------|---------|
+| Layer → Agent | `ClientMessage::GetEnvVarsRequest { env_vars_filter, env_vars_select }` |
+| Agent → Layer | `DaemonMessage::GetEnvVarsResponse(HashMap<String, String>)` |
+
+---
+
+### 9.9 Message Routing Through the Intproxy
+
+All messages between layer and agent pass through the intproxy. Understanding how the intproxy dispatches messages is essential for working on any flow.
+
+#### Layer → Agent direction
+
+**Where:** `mirrord/intproxy/src/lib.rs` — `handle_layer_message()`
+
+Every message from the layer arrives as a `FromLayer { message_id, layer_id, message }`. The intproxy checks the message type and sends it to the right proxy task:
+
+| Message type | Routed to | Then sent to agent as |
+|-------------|-----------|----------------------|
+| `LayerToProxyMessage::File(req)` | `FilesProxy` | `ClientMessage::FileRequest(req)` |
+| `LayerToProxyMessage::GetAddrInfo(req)` | `SimpleProxy` | `ClientMessage::GetAddrInfoRequest(req)` |
+| `LayerToProxyMessage::GetEnv(req)` | `SimpleProxy` | `ClientMessage::GetEnvVarsRequest(req)` |
+| `LayerToProxyMessage::Outgoing(req)` | `OutgoingProxy` | `ClientMessage::TcpOutgoing(req)` |
+| `LayerToProxyMessage::Incoming(req)` | `IncomingProxy` | `ClientMessage::TcpSteal(req)` |
+
+Each proxy task maintains a **request queue** — a FIFO list of `(message_id, layer_id)` pairs. When a response comes back from the agent, the proxy pops the oldest entry from the queue to figure out which layer sent the original request.
+
+#### Agent → Layer direction
+
+**Where:** `mirrord/intproxy/src/lib.rs` — `handle_agent_message()`
+
+| Message type | Routed to |
+|-------------|-----------|
+| `DaemonMessage::File(res)` | `FilesProxy` |
+| `DaemonMessage::GetAddrInfoResponse(res)` | `SimpleProxy` |
+| `DaemonMessage::GetEnvVarsResponse(res)` | `SimpleProxy` |
+| `DaemonMessage::TcpOutgoing(msg)` | `OutgoingProxy` |
+| `DaemonMessage::UdpOutgoing(msg)` | `OutgoingProxy` |
+| `DaemonMessage::Tcp(msg)` | `IncomingProxy` (mirror mode) |
+| `DaemonMessage::TcpSteal(msg)` | `IncomingProxy` (steal mode) |
+| `DaemonMessage::Pong` | `PingPong` |
+| `DaemonMessage::SwitchProtocolVersionResponse(v)` | All proxies (sets protocol version) |
+
+---
+
+### 9.10 Agent Main Loop
+
+**Where:** `mirrord/agent/src/entrypoint.rs` — `ClientConnectionHandler::start()`
+
+The agent uses a `tokio::select!` loop — a Rust construct that waits on multiple async event sources simultaneously and processes whichever one fires first. There are seven branches:
+
+```
+loop {
+    tokio::select! {
+        // 1. Message from the layer (via intproxy)
+        msg = connection.receive() => {
+            handle_client_message(msg)
+            // dispatches to: file_manager, tcp_outgoing_api, dns_api, etc.
+        }
+
+        // 2. Mirrored traffic from TcpMirrorApi
+        msg = tcp_mirror_api.recv() => respond(msg)
+
+        // 3. Stolen traffic from TcpStealerApi
+        msg = tcp_stealer_api.recv() => respond(msg)
+
+        // 4. Outgoing TCP data from TcpOutgoingApi
+        msg = tcp_outgoing_api.recv_from_task() => respond(msg)
+
+        // 5. Outgoing UDP data from UdpOutgoingApi
+        msg = udp_outgoing_api.recv_from_task() => respond(DaemonMessage::UdpOutgoing(msg))
+
+        // 6. DNS resolution results from DnsWorker
+        msg = dns_api.recv() => respond(DaemonMessage::GetAddrInfoResponse(msg))
+
+        // 7. Reverse DNS results
+        msg = reverse_dns_api.recv() => respond(DaemonMessage::ReverseDnsLookup(msg))
+    }
+}
+```
+
+`handle_client_message()` (same file) dispatches each `ClientMessage` variant:
+
+| ClientMessage variant | Handler |
+|----------------------|---------|
+| `FileRequest(req)` | `file_manager.handle_message(req)` — synchronous, responds immediately |
+| `TcpOutgoing(msg)` | `tcp_outgoing_api.send_to_task(msg)` — async, response comes via branch 4 |
+| `UdpOutgoing(msg)` | `udp_outgoing_api.send_to_task(msg)` — async, response via branch 5 |
+| `GetEnvVarsRequest(req)` | Filters `self.env`, responds immediately |
+| `GetAddrInfoRequest(req)` | `dns_api.make_request(req)` — async, response via branch 6 |
+| `Tcp(msg)` | `tcp_mirror_api.handle_client_message(msg)` — mirror mode subscriptions |
+| `TcpSteal(msg)` | `tcp_stealer_api.handle_client_message(msg)` — steal mode subscriptions |
+| `Ping` | Responds with `Pong` immediately |
+| `SwitchProtocolVersion(v)` | Negotiates version, responds immediately |
+| `Close` | Returns `false` to exit the loop |
+
+Note the split: file operations and env vars are **synchronous** (the agent handles them and responds in the same function call). Network and DNS operations are **asynchronous** (dispatched to background tasks, responses come back through separate `select!` branches).
